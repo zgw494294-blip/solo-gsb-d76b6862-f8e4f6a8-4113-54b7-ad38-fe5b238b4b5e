@@ -23,6 +23,59 @@ class DecisionError(ValueError):
     """人工决策不合法（如所选区间不在候选列表中）。"""
 
 
+def id_key(ann_id) -> tuple[str, object]:
+    """以 id 的类型与值共同定位批注。
+
+    JSON 里整数 1 与字符串 "1" 是两个不同的合法 id，键里必须保留类型，
+    否则一个 decisions["1"] 会同时命中两条批注。
+    """
+    return type(ann_id).__name__, ann_id
+
+
+def typed_decisions(items: list[dict]) -> dict[tuple[str, object], dict]:
+    """把显式带类型的决策列表整理为 {(类型名, id): 决策}。
+
+    每个决策形如 {"id": <原 id，保留 JSON 类型>, "action": ..., ...}；
+    同一 (类型, 值) 出现两次即重复决策，抛 DecisionError。
+    """
+    by_key: dict[tuple[str, object], dict] = {}
+    for d in items:
+        key = id_key(d["id"])
+        if key in by_key:
+            _, value = key
+            raise DecisionError(f"批注 id 的决策重复：{value!r}")
+        by_key[key] = d
+    return by_key
+
+
+def legacy_decisions(
+    results: list[dict], decisions: dict[str, dict]
+) -> dict[tuple[str, object], dict]:
+    """把旧式 {"id字符串": 决策} 映射到带类型的键。
+
+    旧对象键只能给出字符串形式，无法区分整数 1 与字符串 "1"：该键在本批
+    输入里只对应一个 id 时按原值定位、保持原行为；同时对应整数与字符串
+    两个 id 时无法确定目标，拒绝整批（不得猜测）。需要分别处理时改用
+    decision_items 列表形式。未知键维持历史行为（忽略）。
+    """
+    groups: dict[str, list[tuple[str, object]]] = {}
+    for r in results:
+        groups.setdefault(str(r["id"]), []).append(id_key(r["id"]))
+    by_key: dict[tuple[str, object], dict] = {}
+    for raw_key, d in decisions.items():
+        keys = groups.get(raw_key, [])
+        if len(keys) > 1:
+            kinds = " / ".join(
+                f"{tid}:{value!r}" for tid, value in keys)
+            raise DecisionError(
+                f"决策键 {raw_key!r} 同时匹配多个不同类型的批注 id（{kinds}），"
+                "旧式 decisions 对象无法区分；请改用 decision_items 列表，"
+                '在每项中直接给出原 id（如 {"id": 1} 与 {"id": "1"}）')
+        if keys:
+            by_key[keys[0]] = d
+    return by_key
+
+
 def levenshtein(a: str, b: str) -> int:
     """按码点计算两个字符串的 Levenshtein 编辑距离。"""
     if a == b:
@@ -109,19 +162,35 @@ def _migrate_one(old_text: str, new_text: str, ann: dict, blocks: list) -> dict:
             "candidates": [], "detail": "新版中未找到批注原文，待确认"}
 
 
-def apply_decisions(results: list[dict], decisions: dict[str, dict]) -> tuple[list[dict], list]:
-    """把人工决策应用到迁移结果上。
+def apply_decisions_typed(
+    results: list[dict], by_key: dict[tuple[str, object], dict],
+    strict_targets: bool = True,
+) -> tuple[list[dict], list]:
+    """把已按 (类型, 值) 定位的人工决策应用到迁移结果上。
 
-    返回 (exported, unresolved)：exported 为可导出条目；
-    unresolved 为仍为待确认且未给出决策的批注 id（非空时调用方应拒绝导出）。
+    返回 (exported, unresolved)：exported 为可导出条目，顺序与输入一致；
+    unresolved 为仍为待确认且未给出决策的批注 id（保留原 id 及其类型，
+    非空时调用方应拒绝导出）。决策动作未知或候选区间不合法均抛
+    DecisionError；strict_targets 为真时（新列表形式），引用不存在的 id
+    或对非待确认批注做决策同样拒绝；旧式对象形式保持历史行为（忽略）。
     """
+    result_by_key = {id_key(r["id"]): r for r in results}
+    if strict_targets:
+        for key in by_key:
+            if key not in result_by_key:
+                _, value = key
+                raise DecisionError(f"决策引用的批注 id 不存在：{value!r}")
+            if result_by_key[key]["status"] != PENDING:
+                _, value = key
+                raise DecisionError(f"批注 {value} 不是待确认项，无需人工决策")
+
     exported, unresolved = [], []
     for r in results:
         if r["status"] != PENDING:
             exported.append({"id": r["id"], "start": r["new_start"],
                              "end": r["new_end"], "status": r["status"]})
             continue
-        d = decisions.get(str(r["id"]))
+        d = by_key.get(id_key(r["id"]))
         if d is None:
             unresolved.append(r["id"])
         elif d.get("action") == "abandon":
@@ -134,3 +203,16 @@ def apply_decisions(results: list[dict], decisions: dict[str, dict]) -> tuple[li
         else:
             raise DecisionError(f"批注 {r['id']} 的决策动作未知：{d.get('action')}")
     return exported, unresolved
+
+
+def apply_decisions(results: list[dict], decisions: dict[str, dict]) -> tuple[list[dict], list]:
+    """把旧式对象决策（键为 id 字符串）应用到迁移结果上。
+
+    返回 (exported, unresolved)：exported 为可导出条目；
+    unresolved 为仍为待确认且未给出决策的批注 id（非空时调用方应拒绝导出）。
+    键同时对应整数与字符串两个不同 id 时抛 DecisionError，不得猜测；
+    需要区分 id 类型时用 typed_decisions + apply_decisions_typed。
+    旧式对象的其余历史行为不变：未知键、对非待确认项的决策被忽略。
+    """
+    return apply_decisions_typed(
+        results, legacy_decisions(results, decisions), strict_targets=False)

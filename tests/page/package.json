@@ -1,0 +1,12 @@
+{
+  "name": "migration-page-tests",
+  "private": true,
+  "description": "迁移页面（app/static/app.js）真实 DOM 回归依赖，仅测试期使用，不进容器",
+  "scripts": {
+    "test": "node test_migration_page.mjs"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "jsdom": "^24.1.3"
+  }
+}

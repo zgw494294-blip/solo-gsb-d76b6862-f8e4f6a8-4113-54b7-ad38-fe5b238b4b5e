@@ -10,7 +10,12 @@
   3. **多处命中** → 分别取命中位置前后各 20 个码点，与旧版对应上下文计算 Levenshtein 距离之和，最小者胜出（`disambiguated`）；
   4. 距离仍并列或没有命中 → 标为**待确认**（`pending`）。
 - 页面并排高亮原位置与候选，可人工选择候选（`manual`）或标记废弃（`abandoned`）；
-  **存在未处理的待确认项时禁止导出**；导出保留 `id`，并写入新偏移与状态。
+  **存在未处理的待确认项时禁止导出**；导出保留 `id`（连同其 JSON 类型：
+  整数 `1` 与字符串 `"1"` 是两个不同的合法 id），并写入新偏移与状态。
+  人工决策以 **id 的类型和值共同定位**：页面选择批注、候选预览、确认与撤销
+  均不串用；接口推荐用 `decision_items` 列表逐项携带原 id 传决策。旧式
+  `decisions` 对象以字符串作键，无法区分 `1` 与 `"1"`——该键在本批只对应
+  一个输入 id 时保持原行为，同时对应多个不同类型 id 时返回 **422**，不猜测。
 
 ## 批注集仲裁（/arbitrate）
 
@@ -896,8 +901,8 @@ JSON」得到：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/migrate` | 入参 `{old_text, new_text, annotations:[{id,start,end}]}`，返回每条批注的状态、新偏移与候选 |
-| POST | `/api/export` | 同上加 `decisions`（`{"批注id": {"action":"choose","start":…,"end":…}}` 或 `{"action":"abandon"}`）；仍有未处理待确认项时返回 **409** 并列出 `pending_ids` |
+| POST | `/api/migrate` | 入参 `{old_text, new_text, annotations:[{id,start,end}]}`（`id` 可为整数或字符串，整数 `1` 与字符串 `"1"` 是不同的合法 id；同类型重复 id 返回 **422**），返回每条批注（保留原 id 及其类型）的状态、新偏移与候选 |
+| POST | `/api/export` | 同上，决策二选一：① 旧式 `decisions`（`{"批注id": {"action":"choose","start":…,"end":…}}` 或 `{"action":"abandon"}`），键为字符串，**只对应一个输入 id 时保持原行为，同时对应整数与字符串两个不同类型 id（如键 `"1"` 同时命中 `1` 与 `"1"`）时返回 422 不猜测**；② 推荐的 `decision_items`（`[{"id":<原id,保留类型>,"action":"choose","start":…,"end":…}｜{"id":…,"action":"abandon"}]`），以 id 的类型和值共同定位；两种方式同时提交返回 **422**。非法候选 / 未知 id / 对非待确认项决策 / 同类型重复决策均 **422**；仍有未处理待确认项时返回 **409** 并列出保留原类型的 `pending_ids` |
 | POST | `/api/arbitrate` | 入参 `{text, left:[{id,start,end,label}], right:[…]}`，返回仲裁组 `groups`（含组号、`auto`/`pending` 状态与两侧批注） |
 | POST | `/api/arbitrate/export` | 同上加 `decisions`（`{"组号": "left"｜"right"｜"discard"}`）；后端重新分组并校验决策，仍有未处理组时返回 **409** 并列出 `pending_groups`，决策非法（未知组号 / 未知取值 / 对已自动通过的组做决策）返回 **422** |
 | POST | `/api/sequence/preview` | 入参 `{text, annotations:[{id,start,end,label}]}`，返回 `{layers, tokens:[{text,start,end,tags}]}`（每 token 的各层 BILOU 标签） |
@@ -931,6 +936,54 @@ curl -s http://localhost:8000/api/migrate \
        "new_text":"第一段：全新的新版说明。第二段：保持不变。",
        "annotations":[{"id":"a1","start":13,"end":17}]}'
 ```
+
+整数 id 与字符串 id 并存时的人工决策（两条批注原文均不在新版 → 均待确认）。
+旧式 `decisions` 对象的键 `"1"` 同时匹配整数 `1` 与字符串 `"1"`，无法定位，
+返回 **422**（不猜测）：
+
+```bash
+# 旧版文本长度 13；整数 id 1 覆盖 [0,8)，字符串 id "1" 覆盖 [8,13)
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/api/export \
+  -H 'Content-Type: application/json' \
+  -d '{"old_text":"甲：完全删除。乙：也删除。",
+       "new_text":"全新的内容。",
+       "annotations":[{"id":1,"start":0,"end":8},{"id":"1","start":8,"end":13}],
+       "decisions":{"1":{"action":"abandon"}}}'
+# 422 —— 键 "1" 同时命中整数 1 与字符串 "1"
+```
+
+改用 **`decision_items` 列表**：每项直接给原 id，整数 `1`（无引号）与字符串
+`"1"`（有引号）各自定位。只处理一条时另一条仍待确认 → **409**；分别处理后
+才 **200**：
+
+```bash
+# 只废弃整数 id 1：字符串 "1" 仍待确认 → 409，pending_ids 为 ["1"]
+curl -s http://localhost:8000/api/export \
+  -H 'Content-Type: application/json' \
+  -d '{"old_text":"甲：完全删除。乙：也删除。",
+       "new_text":"全新的内容。",
+       "annotations":[{"id":1,"start":0,"end":8},{"id":"1","start":8,"end":13}],
+       "decision_items":[{"id":1,"action":"abandon"}]}'
+# {"detail":{"message":"存在未处理的待确认批注，禁止导出","pending_ids":["1"]}}
+
+# 两条分别处理后导出 → 200，顺序、原 id 及其类型保持不变
+curl -s http://localhost:8000/api/export \
+  -H 'Content-Type: application/json' \
+  -d '{"old_text":"甲：完全删除。乙：也删除。",
+       "new_text":"全新的内容。",
+       "annotations":[{"id":1,"start":0,"end":8},{"id":"1","start":8,"end":13}],
+       "decision_items":[
+         {"id":1,"action":"abandon"},
+         {"id":"1","action":"abandon"}]}'
+# {"annotations":[
+#   {"id":1,"start":null,"end":null,"status":"abandoned"},
+#   {"id":"1","start":null,"end":null,"status":"abandoned"}]}
+```
+
+选择候选时 `decision_items` 项携带 `{"id":…,"action":"choose","start":…,"end":…}`，
+区间必须在该 id 自己的候选列表中，否则 **422**（候选不会在整数与字符串 id 间串用）。
+页面内部即以 `decision_items` 提交；旧式 `decisions` 对象在批次内没有同值异类型
+id 时行为完全不变。
 
 ```bash
 # 仲裁：分组
@@ -1083,13 +1136,22 @@ uvicorn app.main:app --reload
 python -m pytest tests/
 ```
 
+页面（真实 DOM）回归用 Node + jsdom 驱动 `app/static/app.js`，pytest 会在检测到
+Node 与 `tests/page/node_modules` 时自动运行；也可单独执行：
+
+```bash
+npm --prefix tests/page install   # 仅测试期依赖 jsdom，不进容器 / 不影响其他模块
+npm --prefix tests/page test
+# 或：node tests/page/test_migration_page.mjs
+```
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 入口与接口（迁移 + 仲裁 + 序列标注 + 嵌套审计 + 制式转换 + 审阅切片 + 标签体系迁移 + 遮盖导出 + 可领取审阅工作副本）
   validation.py      # 批注输入校验：策略驱动的入口验证器（文本长度来源 / 码点区间 / 非空 label / id 类型与唯一性作用域 / 额外字段保留 / 错误前缀）
-  migration.py       # 迁移核心：匹配块平移、原文搜索、上下文 Levenshtein 裁决
+  migration.py       # 迁移核心：匹配块平移、原文搜索、上下文 Levenshtein 裁决、按 (id 类型, 值) 定位的人工决策（decision_items 与旧式 decisions 兼容映射）
   arbitration.py     # 仲裁核心：二分图连通分量分组、整组决策校验与导出
   sequence.py        # 序列标注核心：token 切分、批注边界切开、贪心分层、BILOU 与 CoNLL 生成
   nesting.py         # 嵌套审计核心：区间关系检查、栈式建树、label 规则校验与稳定嵌套 JSON 导出
@@ -1101,6 +1163,10 @@ app/
   static/            # 原生 HTML/CSS/JS 前端（index.html 迁移页、arbitrate.html 仲裁页、sequence.html 序列标注页、nesting.html 嵌套审计页、units.html 制式转换页、review.html 审阅切片页、relabel.html 标签体系迁移页）
 tests/
   test_migration.py
+  test_migration_http.py      # 迁移 / 导出 HTTP 回归：整数 1 与字符串 "1" 并存、旧式 decisions 422、decision_items 分别处理、409/200 与原响应不变
+  test_migration_page.py      # 页面真实 DOM 回归（pytest 包装，转 tests/page 下 Node+jsdom 脚本）
+  page/test_migration_page.mjs  # 迁移页：复合键定位、候选预览/确认/废弃/撤销不串用、decision_items 导出 409→200
+  page/package.json           # 页面测试依赖（jsdom，仅测试期，npm --prefix tests/page install）
   test_arbitration.py
   test_sequence.py
   test_nesting.py

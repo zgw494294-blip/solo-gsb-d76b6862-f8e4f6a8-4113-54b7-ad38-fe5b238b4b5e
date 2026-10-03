@@ -9,7 +9,7 @@ from pydantic import BeforeValidator
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.convertors import Convertor, register_url_convertor
 
 from app.arbitration import ArbitrationError, apply_arbitration, build_groups
@@ -26,7 +26,13 @@ from app.copies import (
     RevisionMismatchError,
     RevisionNotFound,
 )
-from app.migration import DecisionError, apply_decisions, migrate_annotations
+from app.migration import (
+    DecisionError,
+    apply_decisions,
+    apply_decisions_typed,
+    migrate_annotations,
+    typed_decisions,
+)
 from app.nesting import (
     NestingError,
     audit_nesting,
@@ -94,8 +100,26 @@ class Decision(BaseModel):
     end: int | None = None
 
 
+class DecisionItem(Decision):
+    # 决策列表形式：id 保留 JSON 原值与类型（整数 1 与字符串 "1" 可区分）
+    id: str | int
+
+
 class ExportRequest(MigrateRequest):
+    # 两种决策传递方式二选一：
+    # - decisions：旧式 {id字符串: 决策}，键无法区分 1 与 "1"，同键对应多个
+    #   不同类型输入 id 时返回 422，不猜测；
+    # - decision_items：[{id, action, start?, end?}]，以 id 的类型和值共同定位
     decisions: dict[str, Decision] = {}
+    decision_items: list[DecisionItem] = []
+
+    @model_validator(mode="after")
+    def _decisions_exclusive(self):
+        if self.decisions and self.decision_items:
+            raise ValueError(
+                "decisions（旧式对象）与 decision_items（带 id 类型的列表）只能二选一，"
+                "请勿同时提交；需要区分整数与字符串 id 时请使用 decision_items")
+        return self
 
 
 class ArbAnnotationIn(BaseModel):
@@ -295,9 +319,14 @@ def migrate(req: MigrateRequest):
 def export(req: ExportRequest):
     (anns,) = validate(req, MIGRATE)
     results = migrate_annotations(req.old_text, req.new_text, anns)
-    decisions = {k: v.model_dump() for k, v in req.decisions.items()}
     try:
-        exported, unresolved = apply_decisions(results, decisions)
+        if req.decision_items:
+            # 列表形式：id 保留 JSON 类型，以 (类型, 值) 精确定位
+            by_key = typed_decisions([d.model_dump() for d in req.decision_items])
+            exported, unresolved = apply_decisions_typed(results, by_key)
+        else:
+            decisions = {k: v.model_dump() for k, v in req.decisions.items()}
+            exported, unresolved = apply_decisions(results, decisions)
     except DecisionError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     if unresolved:

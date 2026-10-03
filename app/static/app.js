@@ -16,12 +16,18 @@ state = {
   oldText, newText,
   annotations,   // 原始批注输入（导出时原样回传）
   results,       // /api/migrate 返回
-  decisions,     // { id字符串: {action:"choose",start,end} | {action:"abandon"} }
-  selectedId,    // 当前选中批注（字符串）
+  decisions,     // Map<复合键, {id(原类型), action:"choose",start,end}|{id,action:"abandon"}>
+  selectedKey,   // 当前选中批注的复合键（id 类型 + 值，区分 1 与 "1"）
   previewCand,   // 待确认项当前预览的候选下标
 }
+
+复合键：id 的 JSON 类型名 + ":" + id 的 JSON 字符串。整数 1 与
+字符串 "1" 的键分别为 "number:1" 与 "string:\"1\""，不会串用。
 */
 let state = null;
+
+const keyOfId = (id) => typeof id + ":" + JSON.stringify(id);
+const findResult = (key) => state.results.find((r) => keyOfId(r.id) === key) || null;
 
 const $ = (id) => document.getElementById(id);
 const cps = (s) => Array.from(s);          // 按码点切分，避免 UTF-16 代理对错位
@@ -78,8 +84,8 @@ async function runMigration() {
       newText: payload.new_text,
       annotations,
       results: data.results,
-      decisions: {},
-      selectedId: data.results.length ? String(data.results[0].id) : null,
+      decisions: new Map(),
+      selectedKey: data.results.length ? keyOfId(data.results[0].id) : null,
       previewCand: 0,
     };
     $("resultPanel").hidden = false;
@@ -95,19 +101,26 @@ async function runMigration() {
 async function runExport() {
   if (!state) return;
   try {
+    // 用 decision_items 列表传决策：每项直接带原 id（保留 number/string
+    // 类型），避免旧式 decisions 对象键把 1 与 "1" 混同
+    const decisionItems = [...state.decisions.values()].map((d) => {
+      const item = { id: d.id, action: d.action };
+      if (d.action === "choose") { item.start = d.start; item.end = d.end; }
+      return item;
+    });
     const data = await api("/api/export", {
       old_text: state.oldText,
       new_text: state.newText,
       annotations: state.annotations,
-      decisions: state.decisions,
+      decision_items: decisionItems,
     });
     download("annotations_migrated.json", JSON.stringify(data.annotations, null, 2));
     toast(`已导出 ${data.annotations.length} 条批注`);
   } catch (e) {
     if (e.status === 409 && e.data && e.data.detail) {
       const ids = e.data.detail.pending_ids || [];
-      toast(`存在 ${ids.length} 条未处理的待确认批注，禁止导出：${ids.join("、")}`);
-      state.selectedId = String(ids[0]);
+      toast(`存在 ${ids.length} 条未处理的待确认批注，禁止导出：${ids.map((id) => JSON.stringify(id)).join("、")}`);
+      state.selectedKey = ids.length ? keyOfId(ids[0]) : null;
       state.previewCand = 0;
       renderAll();
     } else {
@@ -137,13 +150,13 @@ function toast(msg) {
 /* ---------- 状态推导 ---------- */
 
 function effStatus(r) {
-  const d = state.decisions[String(r.id)];
+  const d = state.decisions.get(keyOfId(r.id));
   if (d) return d.action === "abandon" ? "abandoned" : "manual";
   return r.status;
 }
 
 function effRange(r) {
-  const d = state.decisions[String(r.id)];
+  const d = state.decisions.get(keyOfId(r.id));
   if (d && d.action === "choose") return { start: d.start, end: d.end };
   if (d && d.action === "abandon") return null;
   if (r.status !== "pending") return { start: r.new_start, end: r.new_end };
@@ -151,7 +164,8 @@ function effRange(r) {
 }
 
 function pendingLeft() {
-  return state.results.filter((r) => r.status === "pending" && !state.decisions[String(r.id)]).length;
+  return state.results.filter((r) => r.status === "pending"
+    && !state.decisions.has(keyOfId(r.id))).length;
 }
 
 /* ---------- 渲染 ---------- */
@@ -180,12 +194,15 @@ function renderSummary() {
 
 function renderList() {
   const html = state.results.map((r) => {
-    const id = String(r.id);
+    const key = keyOfId(r.id);
+    // 列表展示 id 时保留类型标记：1（数字）与 "1"（字符串）肉眼可辨
+    const idText = typeof r.id === "string" ? `"${r.id}"` : String(r.id)
+      + (typeof r.id === "number" ? "（数字）" : "");
     const st = effStatus(r);
     const meta = STATUS_META[st];
-    const sel = id === state.selectedId ? " selected" : "";
+    const sel = key === state.selectedKey ? " selected" : "";
     const range = effRange(r);
-    const decided = state.decisions[id];
+    const decided = state.decisions.get(key);
 
     let body = `<div class="ann-meta">旧版 [${r.start}, ${r.end})`;
     body += range ? ` → 新版 [${range.start}, ${range.end})` : (st === "abandoned" ? " → 已废弃" : " → 待确认");
@@ -194,26 +211,26 @@ function renderList() {
     if (r.status === "pending" && !decided) {
       if (r.candidates.length) {
         body += `<div class="cand-box">` + r.candidates.map((c, i) =>
-          `<div class="cand-row${i === state.previewCand && id === state.selectedId ? " preview" : ""}" data-action="preview" data-id="${escapeHtml(id)}" data-idx="${i}">
+          `<div class="cand-row${i === state.previewCand && key === state.selectedKey ? " preview" : ""}" data-action="preview" data-key="${escapeHtml(key)}" data-idx="${i}">
              <span class="cand-range">候选${i + 1}：[${c.start}, ${c.end})</span>
              <span class="cand-dist">上下文距离 ${c.distance}</span>
              <span class="cand-actions">
-               <button class="btn small choose" data-action="choose" data-id="${escapeHtml(id)}" data-start="${c.start}" data-end="${c.end}">选此候选</button>
+               <button class="btn small choose" data-action="choose" data-key="${escapeHtml(key)}" data-start="${c.start}" data-end="${c.end}">选此候选</button>
              </span>
            </div>`).join("") + `</div>`;
       } else {
         body += `<div class="ann-detail">无候选位置，可标记废弃。</div>`;
       }
-      body += `<div class="cand-box"><button class="btn small abandon" data-action="abandon" data-id="${escapeHtml(id)}">标记废弃</button></div>`;
+      body += `<div class="cand-box"><button class="btn small abandon" data-action="abandon" data-key="${escapeHtml(key)}">标记废弃</button></div>`;
     } else if (decided) {
       const txt = decided.action === "abandon" ? "已标记废弃" : `已选择候选 [${decided.start}, ${decided.end})`;
       body += `<div class="decided${decided.action === "abandon" ? " abandoned" : ""}">${txt}
-        <button class="btn small undo" data-action="undo" data-id="${escapeHtml(id)}">撤销</button></div>`;
+        <button class="btn small undo" data-action="undo" data-key="${escapeHtml(key)}">撤销</button></div>`;
     }
 
-    return `<div class="ann-item${sel}" data-id="${escapeHtml(id)}">
+    return `<div class="ann-item${sel}" data-key="${escapeHtml(key)}">
       <div class="ann-head">
-        <span class="ann-id">${escapeHtml(id)}</span>
+        <span class="ann-id">${escapeHtml(idText)}</span>
         <span class="badge st-${st}" style="background:var(--c-${st})">${meta.label}</span>
       </div>
       <div class="ann-excerpt">${escapeHtml(r.text)}</div>
@@ -227,21 +244,21 @@ function renderPanes() {
   const oldRanges = [];
   const newRanges = [];
   for (const r of state.results) {
-    const id = String(r.id);
+    const key = keyOfId(r.id);
     const st = effStatus(r);
-    const sel = id === state.selectedId ? " sel" : "";
-    oldRanges.push({ start: r.start, end: r.end, cls: `st-${st}${sel}`, id });
+    const sel = key === state.selectedKey ? " sel" : "";
+    oldRanges.push({ start: r.start, end: r.end, cls: `st-${st}${sel}`, key });
     const range = effRange(r);
-    if (range) newRanges.push({ start: range.start, end: range.end, cls: `st-${st}${sel}`, id });
+    if (range) newRanges.push({ start: range.start, end: range.end, cls: `st-${st}${sel}`, key });
   }
   // 选中的待确认项：在新版视图中叠加全部候选，预览候选高亮
-  const selAnn = state.results.find((r) => String(r.id) === state.selectedId);
-  if (selAnn && selAnn.status === "pending" && !state.decisions[state.selectedId]) {
+  const selAnn = findResult(state.selectedKey);
+  if (selAnn && selAnn.status === "pending" && !state.decisions.has(state.selectedKey)) {
     selAnn.candidates.forEach((c, i) => {
       newRanges.push({
         start: c.start, end: c.end,
         cls: i === state.previewCand ? "cand-sel" : "cand",
-        id: state.selectedId,
+        key: state.selectedKey,
       });
     });
   }
@@ -262,7 +279,7 @@ function renderText(text, ranges) {
   let html = "", pos = 0;
   for (const r of clean) {
     html += escapeHtml(chars.slice(pos, r.start).join(""));
-    html += `<mark class="${r.cls}" data-id="${escapeHtml(String(r.id))}">` +
+    html += `<mark class="${r.cls}" data-key="${escapeHtml(r.key)}">` +
             escapeHtml(chars.slice(r.start, r.end).join("")) + `</mark>`;
     pos = r.end;
   }
@@ -278,8 +295,8 @@ function renderExportBar() {
 }
 
 function scrollToSelected() {
-  if (state.selectedId == null) return;
-  const sel = `mark[data-id="${CSS.escape(state.selectedId)}"].sel, mark.cand-sel`;
+  if (state.selectedKey == null) return;
+  const sel = `mark[data-key="${CSS.escape(state.selectedKey)}"].sel, mark.cand-sel`;
   for (const view of [$("oldView"), $("newView")]) {
     const m = view.querySelector(sel);
     if (m) m.scrollIntoView({ block: "center" });
@@ -291,23 +308,27 @@ function scrollToSelected() {
 function onListClick(e) {
   const btn = e.target.closest("[data-action]");
   if (btn) {
-    const id = btn.dataset.id;
+    const key = btn.dataset.key;
+    const r = findResult(key);
     switch (btn.dataset.action) {
       case "choose":
-        state.decisions[id] = { action: "choose", start: Number(btn.dataset.start), end: Number(btn.dataset.end) };
-        state.selectedId = id;
+        state.decisions.set(key, {
+          id: r.id, action: "choose",
+          start: Number(btn.dataset.start), end: Number(btn.dataset.end),
+        });
+        state.selectedKey = key;
         break;
       case "abandon":
-        state.decisions[id] = { action: "abandon" };
-        state.selectedId = id;
+        state.decisions.set(key, { id: r.id, action: "abandon" });
+        state.selectedKey = key;
         break;
       case "undo":
-        delete state.decisions[id];
-        state.selectedId = id;
+        state.decisions.delete(key);
+        state.selectedKey = key;
         state.previewCand = 0;
         break;
       case "preview":
-        state.selectedId = id;
+        state.selectedKey = key;
         state.previewCand = Number(btn.dataset.idx);
         break;
     }
@@ -316,7 +337,7 @@ function onListClick(e) {
   }
   const item = e.target.closest(".ann-item");
   if (item) {
-    state.selectedId = item.dataset.id;
+    state.selectedKey = item.dataset.key;
     state.previewCand = 0;
     renderAll();
   }
@@ -324,8 +345,8 @@ function onListClick(e) {
 
 function onPaneClick(e) {
   const m = e.target.closest("mark");
-  if (m && m.dataset.id != null) {
-    state.selectedId = m.dataset.id;
+  if (m && m.dataset.key != null) {
+    state.selectedKey = m.dataset.key;
     state.previewCand = 0;
     renderAll();
   }

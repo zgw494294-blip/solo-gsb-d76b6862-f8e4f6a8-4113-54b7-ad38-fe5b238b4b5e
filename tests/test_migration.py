@@ -11,9 +11,13 @@ from app.migration import (
     SHIFTED,
     DecisionError,
     apply_decisions,
+    apply_decisions_typed,
     find_all,
+    id_key,
+    legacy_decisions,
     levenshtein,
     migrate_annotations,
+    typed_decisions,
 )
 
 
@@ -125,3 +129,130 @@ def test_apply_decisions_choose_and_invalid():
 
     with pytest.raises(DecisionError):
         apply_decisions(res, {"t": {"action": "choose", "start": 0, "end": 4}})
+
+
+# ---------- 整数 id 与字符串 id 并存 ----------
+
+def _mixed_pending_results():
+    """两条无命中、均待确认的批注：整数 id 1 在前，字符串 id "1" 在后。"""
+    old = "甲：完全删除。乙：也删除。"
+    new = "全新的内容。"
+    res = migrate_annotations(old, new, [
+        {"id": 1, "start": 0, "end": 8},
+        {"id": "1", "start": 8, "end": 13},
+    ])
+    assert [(r["id"], r["status"]) for r in res] == [(1, PENDING), ("1", PENDING)]
+    return res
+
+
+def test_id_key_distinguishes_int_and_str():
+    assert id_key(1) != id_key("1")
+    assert id_key(1) == id_key(1)
+    assert id_key("1") == id_key("1")
+
+
+def test_legacy_decisions_ambiguous_key_rejected():
+    res = _mixed_pending_results()
+    # 旧对象键 "1" 同时对应整数 1 与字符串 "1"：拒绝，不猜测目标
+    with pytest.raises(DecisionError, match="多个不同类型"):
+        legacy_decisions(res, {"1": {"action": "abandon"}})
+    with pytest.raises(DecisionError):
+        apply_decisions(res, {"1": {"action": "abandon"}})
+
+
+def test_legacy_decisions_unambiguous_key_still_works():
+    # 只对应一个输入 id 时保持原行为（这里键只命中字符串 id）
+    old = "甲：完全删除。"
+    new = "全新的内容。"
+    res = migrate_annotations(old, new, [{"id": "1", "start": 0, "end": 8}])
+    exported, unresolved = apply_decisions(res, {"1": {"action": "abandon"}})
+    assert unresolved == []
+    assert exported == [{"id": "1", "start": None, "end": None, "status": ABANDONED}]
+
+    # 批次中只有整数 1 时，旧键 "1" 照常定位到整数 id
+    res_int = migrate_annotations(old, new, [{"id": 1, "start": 0, "end": 8}])
+    exported, unresolved = apply_decisions(res_int, {"1": {"action": "abandon"}})
+    assert exported == [{"id": 1, "start": None, "end": None, "status": ABANDONED}]
+
+
+def test_legacy_decisions_unknown_key_ignored():
+    # 历史行为：旧对象形式的未知键不报错（忽略）
+    res = _mixed_pending_results()
+    by_key = legacy_decisions(res, {"nope": {"action": "abandon"}})
+    assert by_key == {}
+
+
+def test_typed_decisions_separate_int_and_str():
+    res = _mixed_pending_results()
+    # 只处理整数 1：字符串 "1" 仍待确认
+    by_key = typed_decisions([{"id": 1, "action": "abandon"}])
+    exported, unresolved = apply_decisions_typed(res, by_key)
+    assert exported == [{"id": 1, "start": None, "end": None, "status": ABANDONED}]
+    assert unresolved == ["1"]
+
+    # 再处理字符串 "1"：两条分开处理后全部可导出，顺序与原 id、类型不变
+    by_key = typed_decisions([
+        {"id": 1, "action": "abandon"},
+        {"id": "1", "action": "abandon"},
+    ])
+    exported, unresolved = apply_decisions_typed(res, by_key)
+    assert unresolved == []
+    assert exported == [
+        {"id": 1, "start": None, "end": None, "status": ABANDONED},
+        {"id": "1", "start": None, "end": None, "status": ABANDONED},
+    ]
+
+
+def test_typed_decisions_choose_does_not_cross():
+    # 两条均有并列候选：给整数 id 选候选不得落到字符串 id 上
+    block = "起" * 20 + "目标文本" + "止" * 20
+    old = block + "间隔" + block + "旧位：目标文本。"
+    new = block + "间隔" + block + "旧位：已改写。"
+    start = old.rfind("目标文本")
+    annotations = [
+        {"id": 1, "start": start, "end": start + 4},
+        {"id": "1", "start": start, "end": start + 4},
+    ]
+    res = migrate_annotations(old, new, annotations)
+    cand_int = res[0]["candidates"][0]
+    by_key = typed_decisions([
+        {"id": 1, "action": "choose", "start": cand_int["start"], "end": cand_int["end"]},
+    ])
+    exported, unresolved = apply_decisions_typed(res, by_key)
+    assert exported == [{"id": 1, "start": cand_int["start"], "end": cand_int["end"],
+                         "status": MANUAL}]
+    assert unresolved == ["1"]  # 字符串 id 未被串用
+
+
+def test_typed_decisions_reject_duplicate_same_type():
+    with pytest.raises(DecisionError, match="决策重复"):
+        typed_decisions([{"id": 1, "action": "abandon"},
+                         {"id": 1, "action": "abandon"}])
+    # 不同类型同值不是重复
+    d = typed_decisions([{"id": 1, "action": "abandon"},
+                         {"id": "1", "action": "abandon"}])
+    assert len(d) == 2
+
+
+def test_typed_decisions_reject_unknown_and_non_pending():
+    res = _mixed_pending_results()
+    with pytest.raises(DecisionError, match="不存在"):
+        apply_decisions_typed(res, typed_decisions([{"id": 9, "action": "abandon"}]))
+    with pytest.raises(DecisionError, match="不存在"):
+        apply_decisions_typed(res, typed_decisions([{"id": "9", "action": "abandon"}]))
+
+    old = "保持不变内容"
+    res_shifted = migrate_annotations(old, old, [{"id": 1, "start": 0, "end": 4}])
+    with pytest.raises(DecisionError, match="不是待确认"):
+        apply_decisions_typed(
+            res_shifted, typed_decisions([{"id": 1, "action": "abandon"}]))
+
+
+def test_typed_decisions_invalid_candidate_still_422_logic():
+    res = _mixed_pending_results()
+    with pytest.raises(DecisionError, match="候选"):
+        apply_decisions_typed(
+            res, typed_decisions([{"id": 1, "action": "choose", "start": 0, "end": 4}]))
+    with pytest.raises(DecisionError, match="未知"):
+        apply_decisions_typed(
+            res, typed_decisions([{"id": 1, "action": "rewrite"}]))
