@@ -11,6 +11,7 @@ from app.migration import (
     SHIFTED,
     DecisionError,
     apply_decisions,
+    apply_decisions_typed,
     find_all,
     levenshtein,
     migrate_annotations,
@@ -125,3 +126,147 @@ def test_apply_decisions_choose_and_invalid():
 
     with pytest.raises(DecisionError):
         apply_decisions(res, {"t": {"action": "choose", "start": 0, "end": 4}})
+
+
+# ---------- 整数 id 与字符串 id 不得混同 ----------
+
+def _tie_results():
+    """两处命中且上下文距离并列 → 待确认（带 2 个候选）。"""
+    block = "起" * 20 + "目标文本" + "止" * 20
+    old = block + "间隔" + block + "旧位：目标文本。"
+    new = block + "间隔" + block + "旧位：已改写。"
+    start = old.rfind("目标文本")
+    res = migrate_annotations(old, new, [{"id": "t", "start": start, "end": start + 4}])
+    assert res[0]["status"] == PENDING and len(res[0]["candidates"]) == 2
+    return res
+
+
+def _nohit_results(ann_id):
+    """新版中无原文命中 → 待确认（无候选，只能废弃）。"""
+    res = migrate_annotations("这段文字在新版中被整体删除。", "全新的内容。",
+                              [{"id": ann_id, "start": 0, "end": 6}])
+    assert res[0]["status"] == PENDING and res[0]["candidates"] == []
+    return res
+
+
+def _mixed_results():
+    """同批两条待确认：整数 id 1（并列候选）与字符串 id "1"（无命中）。"""
+    int_res = _tie_results()[0]
+    int_res["id"] = 1
+    str_res = _nohit_results("1")[0]
+    return [int_res, str_res]
+
+
+def test_mixed_ids_both_pending_without_decisions():
+    results = _mixed_results()
+    exported, unresolved = apply_decisions_typed(results, [])
+    assert exported == []
+    # 保留原 id 及其类型
+    assert unresolved == [1, "1"]
+    assert [type(x) for x in unresolved] == [int, str]
+
+
+def test_legacy_dict_key_matching_multiple_ids_rejected():
+    # 旧格式 decisions["1"] 同时命中整数 1 与字符串 "1"：不得猜测、不得一起废弃
+    results = _mixed_results()
+    with pytest.raises(DecisionError, match="多个不同类型"):
+        apply_decisions(results, {"1": {"action": "abandon"}})
+    # 未被偷偷处理：再用空决策仍两条待确认
+    _, unresolved = apply_decisions_typed(results, [])
+    assert unresolved == [1, "1"]
+
+
+def test_legacy_dict_key_single_match_keeps_original_behavior():
+    # 键只对应一个输入 id（纯字符串批次 / 纯整数批次）时保持原行为
+    res = _nohit_results("n")
+    exported, unresolved = apply_decisions(res, {"n": {"action": "abandon"}})
+    assert unresolved == []
+    assert exported == [{"id": "n", "start": None, "end": None, "status": ABANDONED}]
+
+    res = _nohit_results(7)
+    exported, unresolved = apply_decisions(res, {"7": {"action": "abandon"}})
+    assert exported == [{"id": 7, "start": None, "end": None, "status": ABANDONED}]
+
+    # 只存在整数 1 时键 "1" 唯一对应它，照常生效（不因类型不同而拒）
+    res = _nohit_results(1)
+    exported, unresolved = apply_decisions(res, {"1": {"action": "abandon"}})
+    assert exported == [{"id": 1, "start": None, "end": None, "status": ABANDONED}]
+
+
+def test_typed_decisions_locate_by_type_and_value():
+    results = _mixed_results()
+
+    # 只处理整数 1：字符串 "1" 仍待确认
+    exported, unresolved = apply_decisions_typed(
+        results, [{"id": 1, "action": "abandon"}])
+    assert exported == [{"id": 1, "start": None, "end": None, "status": ABANDONED}]
+    assert unresolved == ["1"]
+
+    # 再单独处理字符串 "1"：整数 1 的废弃结果不受影响
+    exported, unresolved = apply_decisions_typed(
+        results, [{"id": 1, "action": "abandon"}, {"id": "1", "action": "abandon"}])
+    assert unresolved == []
+    assert exported == [
+        {"id": 1, "start": None, "end": None, "status": ABANDONED},
+        {"id": "1", "start": None, "end": None, "status": ABANDONED},
+    ]
+    assert [type(a["id"]) for a in exported] == [int, str]
+
+
+def test_typed_choose_int_id_does_not_touch_string_id():
+    results = _mixed_results()
+    cand = results[0]["candidates"][0]
+    exported, unresolved = apply_decisions_typed(
+        results, [{"id": 1, "action": "choose",
+                   "start": cand["start"], "end": cand["end"]}])
+    assert exported == [{"id": 1, "start": cand["start"], "end": cand["end"],
+                         "status": MANUAL}]
+    assert unresolved == ["1"]  # 字符串 "1" 未被串用
+
+
+def test_typed_decisions_unknown_id_rejected():
+    res = _nohit_results("1")
+    with pytest.raises(DecisionError, match="不存在"):
+        apply_decisions_typed(res, [{"id": 1, "action": "abandon"}])
+    with pytest.raises(DecisionError, match="不存在"):
+        apply_decisions_typed(res, [{"id": "x", "action": "abandon"}])
+
+
+def test_typed_decisions_duplicate_same_id_rejected():
+    results = _mixed_results()
+    with pytest.raises(DecisionError, match="多条决策"):
+        apply_decisions_typed(results, [
+            {"id": 1, "action": "abandon"},
+            {"id": 1, "action": "abandon"},
+        ])
+    # 同类型重复（两个字符串键）也拒绝
+    with pytest.raises(DecisionError, match="多条决策"):
+        apply_decisions_typed(_nohit_results("a"), [
+            {"id": "a", "action": "abandon"},
+            {"id": "a", "action": "abandon"},
+        ])
+
+
+def test_typed_decisions_invalid_candidate_still_422():
+    res = _tie_results()
+    res[0]["id"] = 1
+    # 整数 id 选择不在候选列表中的区间：同样抛 DecisionError
+    with pytest.raises(DecisionError):
+        apply_decisions_typed(res, [{"id": 1, "action": "choose",
+                                     "start": 0, "end": 4}])
+    # 动作非法
+    with pytest.raises(DecisionError):
+        apply_decisions_typed(res, [{"id": 1, "action": "what"}])
+
+
+def test_typed_decisions_preserve_export_order_and_nonpending():
+    # 非待确认项无需决策即按原序导出，且保留 id 类型
+    res = migrate_annotations(
+        "第一段：旧版说明。第二段：保持不变。",
+        "第一段：全新的新版说明。第二段：保持不变。",
+        [{"id": 1, "start": 13, "end": 17},
+         {"id": "1", "start": 0, "end": 3}])
+    exported, unresolved = apply_decisions_typed(res, [])
+    assert unresolved == []
+    assert [a["id"] for a in exported] == [1, "1"]
+    assert [type(a["id"]) for a in exported] == [int, str]

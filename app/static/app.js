@@ -14,11 +14,12 @@ const STATUS_ORDER = ["shifted", "matched", "disambiguated", "manual", "abandone
 /*
 state = {
   oldText, newText,
-  annotations,   // 原始批注输入（导出时原样回传）
-  results,       // /api/migrate 返回
-  decisions,     // { id字符串: {action:"choose",start,end} | {action:"abandon"} }
-  selectedId,    // 当前选中批注（字符串）
-  previewCand,   // 待确认项当前预览的候选下标
+  annotations,   // 原始批注输入（导出时原样回传，保留 id 的类型）
+  results,       // /api/migrate 返回（id 保留原类型：整数 1 与字符串 "1" 是两条）
+  decisions,     // [{id:<原id>, action:"choose",start,end} | {id,action:"abandon"}]，
+                 // 按 id 的**类型与值**定位，插入顺序即提交顺序
+  selectedIdx,   // 当前选中批注在 results 中的下标
+  previewCand,   // 当前选中项正在预览的候选下标
 }
 */
 let state = null;
@@ -26,7 +27,12 @@ let state = null;
 const $ = (id) => document.getElementById(id);
 const cps = (s) => Array.from(s);          // 按码点切分，避免 UTF-16 代理对错位
 const escapeHtml = (s) =>
-  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/* 以 id 的类型与值共同定位：整数 1 与字符串 "1" 不得混同 */
+const idKey = (id) => (typeof id === "number" ? `n:${String(id)}` : `s:${id}`);
+/* 页面展示时给出类型线索：数字原样显示，字符串加引号 */
+const formatId = (id) => (typeof id === "number" ? String(id) : `"${id}"`);
 
 document.addEventListener("DOMContentLoaded", () => {
   $("demoBtn").addEventListener("click", loadDemo);
@@ -58,6 +64,29 @@ async function api(path, body) {
   return data;
 }
 
+/* ---------- 决策（按 id 的类型与值精确定位） ---------- */
+
+function decisionIndex(r) {
+  const key = idKey(r.id);
+  return state.decisions.findIndex((d) => idKey(d.id) === key);
+}
+
+function findDecision(r) {
+  const i = decisionIndex(r);
+  return i === -1 ? null : state.decisions[i];
+}
+
+function putDecision(r, d) {
+  const i = decisionIndex(r);
+  if (i === -1) state.decisions.push(d);
+  else state.decisions[i] = d;
+}
+
+function dropDecision(r) {
+  const i = decisionIndex(r);
+  if (i !== -1) state.decisions.splice(i, 1);
+}
+
 /* ---------- 迁移 ---------- */
 
 async function runMigration() {
@@ -78,8 +107,8 @@ async function runMigration() {
       newText: payload.new_text,
       annotations,
       results: data.results,
-      decisions: {},
-      selectedId: data.results.length ? String(data.results[0].id) : null,
+      decisions: [],
+      selectedIdx: data.results.length ? 0 : null,
       previewCand: 0,
     };
     $("resultPanel").hidden = false;
@@ -92,6 +121,13 @@ async function runMigration() {
 
 /* ---------- 导出 ---------- */
 
+function exportDecisions() {
+  // 按 results 的输入顺序提交决策（与原批注同序），id 保留原类型
+  return state.results
+    .map((r) => findDecision(r))
+    .filter((d) => d !== null);
+}
+
 async function runExport() {
   if (!state) return;
   try {
@@ -99,15 +135,19 @@ async function runExport() {
       old_text: state.oldText,
       new_text: state.newText,
       annotations: state.annotations,
-      decisions: state.decisions,
+      // 新格式决策列表：id 原样保留类型，整数 1 与字符串 "1" 分别定位
+      decisions: exportDecisions(),
     });
     download("annotations_migrated.json", JSON.stringify(data.annotations, null, 2));
     toast(`已导出 ${data.annotations.length} 条批注`);
   } catch (e) {
     if (e.status === 409 && e.data && e.data.detail) {
       const ids = e.data.detail.pending_ids || [];
-      toast(`存在 ${ids.length} 条未处理的待确认批注，禁止导出：${ids.join("、")}`);
-      state.selectedId = String(ids[0]);
+      toast(`存在 ${ids.length} 条未处理的待确认批注，禁止导出：${ids.map(formatId).join("、")}`);
+      // pending_ids 保留原 id 与类型，按 (类型, 值) 共同定位
+      const firstKey = ids.length ? idKey(ids[0]) : null;
+      const idx = state.results.findIndex((r) => idKey(r.id) === firstKey);
+      state.selectedIdx = idx === -1 ? state.selectedIdx : idx;
       state.previewCand = 0;
       renderAll();
     } else {
@@ -137,13 +177,13 @@ function toast(msg) {
 /* ---------- 状态推导 ---------- */
 
 function effStatus(r) {
-  const d = state.decisions[String(r.id)];
+  const d = findDecision(r);
   if (d) return d.action === "abandon" ? "abandoned" : "manual";
   return r.status;
 }
 
 function effRange(r) {
-  const d = state.decisions[String(r.id)];
+  const d = findDecision(r);
   if (d && d.action === "choose") return { start: d.start, end: d.end };
   if (d && d.action === "abandon") return null;
   if (r.status !== "pending") return { start: r.new_start, end: r.new_end };
@@ -151,7 +191,7 @@ function effRange(r) {
 }
 
 function pendingLeft() {
-  return state.results.filter((r) => r.status === "pending" && !state.decisions[String(r.id)]).length;
+  return state.results.filter((r) => r.status === "pending" && !findDecision(r)).length;
 }
 
 /* ---------- 渲染 ---------- */
@@ -179,13 +219,13 @@ function renderSummary() {
 }
 
 function renderList() {
-  const html = state.results.map((r) => {
-    const id = String(r.id);
+  const html = state.results.map((r, idx) => {
+    // 所有控件以结果下标 data-idx 定位，绝不以 String(id) 串联整数与字符串 id
     const st = effStatus(r);
     const meta = STATUS_META[st];
-    const sel = id === state.selectedId ? " selected" : "";
+    const sel = idx === state.selectedIdx ? " selected" : "";
     const range = effRange(r);
-    const decided = state.decisions[id];
+    const decided = findDecision(r);
 
     let body = `<div class="ann-meta">旧版 [${r.start}, ${r.end})`;
     body += range ? ` → 新版 [${range.start}, ${range.end})` : (st === "abandoned" ? " → 已废弃" : " → 待确认");
@@ -194,26 +234,26 @@ function renderList() {
     if (r.status === "pending" && !decided) {
       if (r.candidates.length) {
         body += `<div class="cand-box">` + r.candidates.map((c, i) =>
-          `<div class="cand-row${i === state.previewCand && id === state.selectedId ? " preview" : ""}" data-action="preview" data-id="${escapeHtml(id)}" data-idx="${i}">
+          `<div class="cand-row${i === state.previewCand && idx === state.selectedIdx ? " preview" : ""}" data-action="preview" data-idx="${idx}" data-cand="${i}">
              <span class="cand-range">候选${i + 1}：[${c.start}, ${c.end})</span>
              <span class="cand-dist">上下文距离 ${c.distance}</span>
              <span class="cand-actions">
-               <button class="btn small choose" data-action="choose" data-id="${escapeHtml(id)}" data-start="${c.start}" data-end="${c.end}">选此候选</button>
+               <button class="btn small choose" data-action="choose" data-idx="${idx}" data-start="${c.start}" data-end="${c.end}">选此候选</button>
              </span>
            </div>`).join("") + `</div>`;
       } else {
         body += `<div class="ann-detail">无候选位置，可标记废弃。</div>`;
       }
-      body += `<div class="cand-box"><button class="btn small abandon" data-action="abandon" data-id="${escapeHtml(id)}">标记废弃</button></div>`;
+      body += `<div class="cand-box"><button class="btn small abandon" data-action="abandon" data-idx="${idx}">标记废弃</button></div>`;
     } else if (decided) {
       const txt = decided.action === "abandon" ? "已标记废弃" : `已选择候选 [${decided.start}, ${decided.end})`;
       body += `<div class="decided${decided.action === "abandon" ? " abandoned" : ""}">${txt}
-        <button class="btn small undo" data-action="undo" data-id="${escapeHtml(id)}">撤销</button></div>`;
+        <button class="btn small undo" data-action="undo" data-idx="${idx}">撤销</button></div>`;
     }
 
-    return `<div class="ann-item${sel}" data-id="${escapeHtml(id)}">
+    return `<div class="ann-item${sel}" data-idx="${idx}">
       <div class="ann-head">
-        <span class="ann-id">${escapeHtml(id)}</span>
+        <span class="ann-id">${escapeHtml(formatId(r.id))}</span>
         <span class="badge st-${st}" style="background:var(--c-${st})">${meta.label}</span>
       </div>
       <div class="ann-excerpt">${escapeHtml(r.text)}</div>
@@ -226,22 +266,21 @@ function renderList() {
 function renderPanes() {
   const oldRanges = [];
   const newRanges = [];
-  for (const r of state.results) {
-    const id = String(r.id);
+  state.results.forEach((r, idx) => {
     const st = effStatus(r);
-    const sel = id === state.selectedId ? " sel" : "";
-    oldRanges.push({ start: r.start, end: r.end, cls: `st-${st}${sel}`, id });
+    const sel = idx === state.selectedIdx ? " sel" : "";
+    oldRanges.push({ start: r.start, end: r.end, cls: `st-${st}${sel}`, idx });
     const range = effRange(r);
-    if (range) newRanges.push({ start: range.start, end: range.end, cls: `st-${st}${sel}`, id });
-  }
+    if (range) newRanges.push({ start: range.start, end: range.end, cls: `st-${st}${sel}`, idx });
+  });
   // 选中的待确认项：在新版视图中叠加全部候选，预览候选高亮
-  const selAnn = state.results.find((r) => String(r.id) === state.selectedId);
-  if (selAnn && selAnn.status === "pending" && !state.decisions[state.selectedId]) {
+  const selAnn = state.results[state.selectedIdx];
+  if (selAnn && selAnn.status === "pending" && !findDecision(selAnn)) {
     selAnn.candidates.forEach((c, i) => {
       newRanges.push({
         start: c.start, end: c.end,
         cls: i === state.previewCand ? "cand-sel" : "cand",
-        id: state.selectedId,
+        idx: state.selectedIdx,
       });
     });
   }
@@ -262,7 +301,7 @@ function renderText(text, ranges) {
   let html = "", pos = 0;
   for (const r of clean) {
     html += escapeHtml(chars.slice(pos, r.start).join(""));
-    html += `<mark class="${r.cls}" data-id="${escapeHtml(String(r.id))}">` +
+    html += `<mark class="${r.cls}" data-idx="${r.idx}">` +
             escapeHtml(chars.slice(r.start, r.end).join("")) + `</mark>`;
     pos = r.end;
   }
@@ -278,8 +317,9 @@ function renderExportBar() {
 }
 
 function scrollToSelected() {
-  if (state.selectedId == null) return;
-  const sel = `mark[data-id="${CSS.escape(state.selectedId)}"].sel, mark.cand-sel`;
+  if (state.selectedIdx == null) return;
+  // 仅选中批注自身的 mark 带 sel；候选高亮 mark.cand-sel 由 CSS 区分
+  const sel = `mark[data-idx="${state.selectedIdx}"].sel, mark.cand-sel`;
   for (const view of [$("oldView"), $("newView")]) {
     const m = view.querySelector(sel);
     if (m) m.scrollIntoView({ block: "center" });
@@ -291,24 +331,27 @@ function scrollToSelected() {
 function onListClick(e) {
   const btn = e.target.closest("[data-action]");
   if (btn) {
-    const id = btn.dataset.id;
+    const idx = Number(btn.dataset.idx);
+    const r = state.results[idx];
     switch (btn.dataset.action) {
       case "choose":
-        state.decisions[id] = { action: "choose", start: Number(btn.dataset.start), end: Number(btn.dataset.end) };
-        state.selectedId = id;
+        // 决策携带原 id（保留类型），只作用于下标 idx 这一条
+        putDecision(r, { id: r.id, action: "choose",
+                         start: Number(btn.dataset.start), end: Number(btn.dataset.end) });
+        state.selectedIdx = idx;
         break;
       case "abandon":
-        state.decisions[id] = { action: "abandon" };
-        state.selectedId = id;
+        putDecision(r, { id: r.id, action: "abandon" });
+        state.selectedIdx = idx;
         break;
       case "undo":
-        delete state.decisions[id];
-        state.selectedId = id;
+        dropDecision(r);
+        state.selectedIdx = idx;
         state.previewCand = 0;
         break;
       case "preview":
-        state.selectedId = id;
-        state.previewCand = Number(btn.dataset.idx);
+        state.selectedIdx = idx;
+        state.previewCand = Number(btn.dataset.cand);
         break;
     }
     renderAll();
@@ -316,7 +359,7 @@ function onListClick(e) {
   }
   const item = e.target.closest(".ann-item");
   if (item) {
-    state.selectedId = item.dataset.id;
+    state.selectedIdx = Number(item.dataset.idx);
     state.previewCand = 0;
     renderAll();
   }
@@ -324,8 +367,8 @@ function onListClick(e) {
 
 function onPaneClick(e) {
   const m = e.target.closest("mark");
-  if (m && m.dataset.id != null) {
-    state.selectedId = m.dataset.id;
+  if (m && m.dataset.idx != null) {
+    state.selectedIdx = Number(m.dataset.idx);
     state.previewCand = 0;
     renderAll();
   }

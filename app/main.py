@@ -26,7 +26,12 @@ from app.copies import (
     RevisionMismatchError,
     RevisionNotFound,
 )
-from app.migration import DecisionError, apply_decisions, migrate_annotations
+from app.migration import (
+    DecisionError,
+    apply_decisions,
+    apply_decisions_typed,
+    migrate_annotations,
+)
 from app.nesting import (
     NestingError,
     audit_nesting,
@@ -94,8 +99,25 @@ class Decision(BaseModel):
     end: int | None = None
 
 
+class TypedDecision(Decision):
+    """新格式决策：id 原样保留整数 / 字符串类型，与值共同定位批注。
+
+    bool 是 int 的子类，这里禁止 pydantic 把 JSON true/false 智能强转成
+    整数 id（与入口校验拒绝布尔偏移的口径一致）。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    id: str | int
+
+
 class ExportRequest(MigrateRequest):
-    decisions: dict[str, Decision] = {}
+    # decisions 支持两种形态（pydantic smart union 按入参判别）：
+    #   dict（旧格式）：{"<id字符串>": 决策}，键唯一对应一个输入 id 时保持
+    #                  原行为，对应多个时 422；
+    #   list（新格式）：[{"id": <原id>, ...}, ...]，id 保留整数/字符串类型，
+    #                  按类型与值精确定位，可区分整数 1 与字符串 "1"。
+    decisions: dict[str, Decision] | list[TypedDecision] = {}
 
 
 class ArbAnnotationIn(BaseModel):
@@ -295,9 +317,16 @@ def migrate(req: MigrateRequest):
 def export(req: ExportRequest):
     (anns,) = validate(req, MIGRATE)
     results = migrate_annotations(req.old_text, req.new_text, anns)
-    decisions = {k: v.model_dump() for k, v in req.decisions.items()}
     try:
-        exported, unresolved = apply_decisions(results, decisions)
+        if isinstance(req.decisions, dict):
+            # 旧格式：字符串键只对应一个输入 id 时保持原行为；对应多个
+            # （如同批含 1 与 "1"）时无法猜测目标，返回 422。
+            raw = {k: v.model_dump() for k, v in req.decisions.items()}
+            exported, unresolved = apply_decisions(results, raw)
+        else:
+            # 新格式：id 原样保留类型，按类型与值精确定位，不串用。
+            raw = [d.model_dump() for d in req.decisions]
+            exported, unresolved = apply_decisions_typed(results, raw)
     except DecisionError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     if unresolved:

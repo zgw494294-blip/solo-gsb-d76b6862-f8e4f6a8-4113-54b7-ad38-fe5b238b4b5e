@@ -10,7 +10,10 @@
   3. **多处命中** → 分别取命中位置前后各 20 个码点，与旧版对应上下文计算 Levenshtein 距离之和，最小者胜出（`disambiguated`）；
   4. 距离仍并列或没有命中 → 标为**待确认**（`pending`）。
 - 页面并排高亮原位置与候选，可人工选择候选（`manual`）或标记废弃（`abandoned`）；
-  **存在未处理的待确认项时禁止导出**；导出保留 `id`，并写入新偏移与状态。
+  **存在未处理的待确认项时禁止导出**；导出保留 `id`（含整数 / 字符串类型），并写入新偏移与状态。
+  人工决策按 id 的**类型与值共同定位**：同批整数 `1` 与字符串 `"1"` 是两条不同批注，
+  页面的选择 / 预览 / 确认 / 撤销互不串用；导出推荐用 `decisions` 数组逐条携带原 id
+  （旧格式对象键只对应一个输入 id 时保持原行为，对应多个时返回 **422**，不猜测）。
 
 ## 批注集仲裁（/arbitrate）
 
@@ -593,6 +596,66 @@ docker compose up --build
 ]
 ```
 
+### 人工决策与整数 / 字符串 id 的区分
+
+批注 `id` 允许整数或字符串，且**原样保留类型**：同批里的整数 `1` 与字符串
+`"1"` 是两条合法的不同批注。待确认项的人工决策有两种传递方式：
+
+- **旧格式 `decisions` 对象**：键是 JSON 对象键，只能是字符串。键**唯一对应
+  一个输入 id 时行为不变**；当同一键同时对应多条输入批注（如既有 `1` 又有
+  `"1"`）时服务端无法判断目标，直接返回 **422**，**不猜测、不一起处理**。
+- **新格式 `decisions` 数组（推荐）**：每条决策显式携带原 `id`，按 id 的
+  **类型与值共同定位**，`1` 与 `"1"` 的选择候选 / 确认 / 撤销互不串用；
+  引用未知 id、同一 id 提交多条决策返回 **422**。页面导出始终使用该格式。
+
+下面用一个两条都进入待确认的批次演示（整数 `1` 在新版有两处并列候选
+`[20,24)`、`[66,70)`；字符串 `"1"` 原文被删除、无候选只能废弃）：
+
+```bash
+# 用 Python 生成请求体（长重复文本仅为制造上下文完全相同的两处命中）
+python3 - <<'JSON' > /tmp/migrate.json
+import json
+B = "起"*20 + "目标文本" + "止"*20
+old = B + "间隔" + B + "旧位：目标文本。\n删除片段"
+new = B + "间隔" + B + "旧位：已改写。\n全新内容"
+s = old.rfind("目标文本")
+print(json.dumps({"old_text": old, "new_text": new, "annotations": [
+    {"id": 1,   "start": s,   "end": s + 4},     # 整数 1：并列待确认
+    {"id": "1", "start": s+5, "end": s + 9},     # 字符串 "1"：无命中待确认
+]}))
+JSON
+
+# 不带决策导出 → 409，pending_ids 保留类型：[1, "1"]
+curl -s -o /tmp/r1.json -w '%{http_code}\n' -X POST http://localhost:8000/api/export \
+  -H 'Content-Type: application/json' --data @/tmp/migrate.json   # 409
+cat /tmp/r1.json
+# {"detail":{"message":"存在未处理的待确认批注，禁止导出","pending_ids":[1,"1"]}}
+
+# 旧格式 decisions["1"] 同时撞上整数 1 与字符串 "1" → 422（不猜测）
+python3 -c 'import json;d=json.load(open("/tmp/migrate.json"));d["decisions"]={"1":{"action":"abandon"}};print(json.dumps(d))' \
+  | curl -s -o /tmp/r2.json -w '%{http_code}\n' -X POST http://localhost:8000/api/export \
+      -H 'Content-Type: application/json' --data @-                    # 422
+cat /tmp/r2.json
+# {"detail":"决策键 '1' 同时对应多个不同类型的批注 id [1, '1']，无法确定目标；…"}
+
+# 新格式数组：只废弃字符串 "1"，整数 1 仍待确认 → 409，pending_ids=[1]
+python3 -c 'import json;d=json.load(open("/tmp/migrate.json"));d["decisions"]=[{"id":"1","action":"abandon"}];print(json.dumps(d))' \
+  | curl -s -o /tmp/r3.json -w '%{http_code}\n' -X POST http://localhost:8000/api/export \
+      -H 'Content-Type: application/json' --data @-                    # 409
+cat /tmp/r3.json   # {"detail":{…,"pending_ids":[1]}}
+
+# 两条分别处理：整数 1 选候选 [20,24)，字符串 "1" 废弃 → 200，顺序与类型不变
+python3 -c 'import json;d=json.load(open("/tmp/migrate.json"));d["decisions"]=[{"id":1,"action":"choose","start":20,"end":24},{"id":"1","action":"abandon"}];print(json.dumps(d))' \
+  | curl -s -X POST http://localhost:8000/api/export \
+      -H 'Content-Type: application/json' --data @-
+# {"annotations":[{"id":1,"start":20,"end":24,"status":"manual"},
+#                 {"id":"1","start":null,"end":null,"status":"abandoned"}]}
+```
+
+非法候选（`start/end` 不在该批注的候选列表中）返回 **422**；同类型重复 id
+（两个整数 `1` 或两个字符串 `"1"`）在入口校验处即返回 **422**，而 `1` 与
+`"1"` 这种同值不同类型的组合是合法的、不会被拒收。
+
 ## 仲裁最小输入示例
 
 打开 **http://localhost:8000/arbitrate**，三个输入框分别对应：文本、左侧批注 JSON、右侧批注 JSON。
@@ -896,8 +959,8 @@ JSON」得到：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/migrate` | 入参 `{old_text, new_text, annotations:[{id,start,end}]}`，返回每条批注的状态、新偏移与候选 |
-| POST | `/api/export` | 同上加 `decisions`（`{"批注id": {"action":"choose","start":…,"end":…}}` 或 `{"action":"abandon"}`）；仍有未处理待确认项时返回 **409** 并列出 `pending_ids` |
+| POST | `/api/migrate` | 入参 `{old_text, new_text, annotations:[{id,start,end}]}`，返回每条批注的状态、新偏移与候选；`id` 可为整数或字符串且原样保留（整数 `1` 与字符串 `"1"` 是**两条不同批注**，不判重、不拒收） |
+| POST | `/api/export` | 同上加人工决策，支持两种传递方式：①旧格式 `decisions` 对象（`{"批注id": {"action":"choose","start":…,"end":…}}` 或 `{"action":"abandon"}`）——JSON 对象键只能是字符串，**键只对应一个输入 id 时保持原行为，同时对应多个（如批次里既有整数 `1` 又有字符串 `"1"`）时返回 422，不猜测**；②新格式 `decisions` 数组 `[{"id":<原id>,"action":…,"start"?,"end"?}, …]`——`id` 原样保留整数 / 字符串类型，按**类型与值**精确定位，可安全处理 `1` 与 `"1"` 混批。仍有未处理待确认项时返回 **409** 并列出保留类型的 `pending_ids`；选择区间不在候选中、数组里引用未知 id 或同一 id 重复提交均返回 **422** |
 | POST | `/api/arbitrate` | 入参 `{text, left:[{id,start,end,label}], right:[…]}`，返回仲裁组 `groups`（含组号、`auto`/`pending` 状态与两侧批注） |
 | POST | `/api/arbitrate/export` | 同上加 `decisions`（`{"组号": "left"｜"right"｜"discard"}`）；后端重新分组并校验决策，仍有未处理组时返回 **409** 并列出 `pending_groups`，决策非法（未知组号 / 未知取值 / 对已自动通过的组做决策）返回 **422** |
 | POST | `/api/sequence/preview` | 入参 `{text, annotations:[{id,start,end,label}]}`，返回 `{layers, tokens:[{text,start,end,tags}]}`（每 token 的各层 BILOU 标签） |
@@ -1083,6 +1146,18 @@ uvicorn app.main:app --reload
 python -m pytest tests/
 ```
 
+迁移页前端回归（选择批注 / 候选预览 / 确认 / 撤销按 id 类型与值定位）需要
+Node.js，用 jsdom 跑真实 DOM；首次运行前安装依赖即可（`node_modules` 已在
+`.gitignore` 中）：
+
+```bash
+cd tests/page && npm install && cd ../..
+python -m pytest tests/test_migration_page.py   # 经 pytest 调用
+# 或直接：cd tests/page && node migration_page.test.js
+```
+
+未安装 Node.js 或未安装页面依赖时，该用例自动跳过，不影响其余 Python 套件。
+
 ## 项目结构
 
 ```
@@ -1115,7 +1190,11 @@ tests/
   test_copy_history.py       # 历史回看：版本快照记录、同事务提交、baseline 补记与 HTTP 接口
   test_copy_diff.py          # 两版改动比较：id 对齐 / 四字段 / 码点序 / 倒序同版 / 结稿空清单 / 404·422
   test_copy_special_ids_http.py  # 空串 / 含"/" / 字面"%2F" / 含换行 特殊 id 的真实 HTTP（uvicorn）全流程回归
+  test_migration.py             # 迁移核心：含整数 1 与字符串 "1" 决策按类型与值分别定位、旧格式歧义 422
+  test_migration_http.py        # 迁移 / 导出 HTTP：混批 409/422、decision_list、非法候选、同类型重复 id
+  test_migration_page.py        # 迁移页前端回归（pytest 包装，调用 tests/page 下 Node + jsdom 脚本）
   test_validation.py
+tests/page/                     # 迁移页前端回归（jsdom 真实 DOM；npm install 后由 pytest 或 node 直接运行）
 Dockerfile
 docker-compose.yml
 requirements.txt

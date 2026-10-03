@@ -1,0 +1,12 @@
+{
+  "name": "migration-page-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "迁移页前端回归（jsdom 真实 DOM；由 tests/test_migration_page.py 经 pytest 调用）",
+  "scripts": {
+    "test": "node migration_page.test.js"
+  },
+  "dependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
